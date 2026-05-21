@@ -1,0 +1,370 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import precision_score
+from sklearn.model_selection import TimeSeriesSplit
+import matplotlib.pyplot as plt
+import sys
+import os
+import xgboost as xgb
+import warnings
+warnings.filterwarnings('ignore')
+
+# ================== OPTIONS ==================
+VNINDEX_FILE = r'D:\data\VNINDEX.csv'  
+
+STOCK_FILES = [
+    r'D:\data\MBB.csv',
+    r'D:\data\TCB.csv',
+    r'D:\data\SHB.csv',
+    r'D:\data\VPB.csv',
+    r'D:\data\CTG.csv'
+]
+
+GRID_LOOKAHEAD = [10, 20, 30, 40]
+GRID_TP = [0.05, 0.08, 0.10, 0.15]
+GRID_SL = [-0.05, -0.08]
+GRID_THRESH = [0.60, 0.65, 0.70]
+
+MIN_TRADES_REQUIRED = 5 
+CV_SPLITS = 3         
+
+N_ESTIMATORS = 150    
+MAX_DEPTH = 4         
+LEARNING_RATE = 0.05  
+# ======================================================================
+
+def parse_number(value):
+    if isinstance(value, str):
+        value = value.replace(',', '').replace(' ', '').strip()
+        if 'M' in value.upper(): return float(value.upper().replace('M', '')) * 1_000_000
+        elif 'K' in value.upper(): return float(value.upper().replace('K', '')) * 1_000
+        try: return float(value)
+        except: return np.nan
+    return value
+
+def load_data(file_path, is_vnindex=False):
+    if not os.path.exists(file_path): 
+        return None
+    try: 
+        df = pd.read_csv(file_path, encoding='utf-8-sig', thousands=',')
+    except Exception as e: 
+        return None
+        
+    df.columns = df.columns.str.strip()
+    
+    if is_vnindex:
+        if 'VN_Date' in df.columns: df = df.rename(columns={'VN_Date': 'Date'})
+        needed_cols = ['Date', 'VN_Close']
+    else:
+        cols_in_file = df.columns.tolist()
+        needed_cols = ['Date', 'Close', 'Volume']
+        if 'Net_Volume_Foreign' in cols_in_file: needed_cols.append('Net_Volume_Foreign')
+        elif 'KLGD ròng' in cols_in_file: 
+            df = df.rename(columns={'KLGD ròng': 'Net_Volume_Foreign'})
+            needed_cols.append('Net_Volume_Foreign')
+        
+    missing_cols = [col for col in needed_cols if col not in df.columns]
+    if missing_cols: return None
+        
+    df = df[needed_cols]
+    for col in needed_cols:
+        if col != 'Date': df[col] = df[col].apply(parse_number)
+            
+    df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=['Date']).set_index('Date').sort_index()
+    return df
+
+def calculate_features(df):
+    df['Log_Return'] = np.log(df['Close'] / df['Close'].shift(1))
+    
+    # 1. RSI (14 ngày) chuẩn Wilder
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss
+    df['RSI_14'] = 100 - (100 / (1 + rs))
+    
+    # 2. MOMENTUM (14 ngày)
+    df['Momentum_14'] = df['Close'] - df['Close'].shift(14)
+    
+    # --- MACD & EMA CUSTOM ---
+    df['EMA_13'] = df['Close'].ewm(span=13, adjust=False).mean()
+    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
+    df['EMA_13_21_Cross'] = (df['EMA_13'] - df['EMA_21']) / df['EMA_21'] 
+    df['Dist_EMA_13'] = (df['Close'] - df['EMA_13']) / df['EMA_13']      
+    
+    exp_10 = df['Close'].ewm(span=10, adjust=False).mean()
+    exp_50 = df['Close'].ewm(span=50, adjust=False).mean()
+    df['MACD_10_50'] = exp_10 - exp_50
+    df['MACD_Signal_100'] = df['MACD_10_50'].ewm(span=100, adjust=False).mean()
+    df['MACD_Hist_Custom'] = df['MACD_10_50'] - df['MACD_Signal_100'] 
+    
+    # 3. BOLLINGER BANDS (20, 2) chuẩn Population Std
+    df['BB_Mid'] = df['Close'].rolling(window=20).mean()
+    df['BB_Std'] = df['Close'].rolling(window=20).std(ddof=0) 
+    df['BB_Upper'] = df['BB_Mid'] + (df['BB_Std'] * 2)
+    df['BB_Lower'] = df['BB_Mid'] - (df['BB_Std'] * 2)
+    df['Dist_BB_Upper'] = (df['Close'] - df['BB_Upper']) / df['BB_Upper']
+    df['Dist_BB_Lower'] = (df['Close'] - df['BB_Lower']) / df['BB_Lower']
+    
+    df['Volatility'] = df['Log_Return'].rolling(window=20).std()
+    df['VN_Return'] = np.log(df['VN_Close'] / df['VN_Close'].shift(1))
+    df['VN_Volatility'] = df['VN_Return'].rolling(window=20).std()
+    df['Relative_Strength'] = df['Log_Return'] - df['VN_Return']
+    df['RS_Trend'] = df['Relative_Strength'].rolling(window=10).mean()
+    df['VN_EMA20'] = df['VN_Close'].ewm(span=20, adjust=False).mean()
+    df['Market_Distance_EMA'] = (df['VN_Close'] - df['VN_EMA20']) / df['VN_EMA20']
+
+    if 'Net_Volume_Foreign' in df.columns:
+        df['Foreign_Net_5D'] = df['Net_Volume_Foreign'].rolling(window=5).sum()
+        df['Foreign_Net_20D_Mean'] = df['Net_Volume_Foreign'].rolling(window=20).mean()
+        df['Foreign_Net_20D_Std'] = df['Net_Volume_Foreign'].rolling(window=20).std()
+        df['Foreign_Mutation'] = (df['Net_Volume_Foreign'] - df['Foreign_Net_20D_Mean']) / (df['Foreign_Net_20D_Std'] + 1e-9)
+    else:
+        df['Foreign_Net_5D'] = 0; df['Foreign_Net_20D_Mean'] = 0; df['Foreign_Mutation'] = 0
+    return df
+
+def calculate_targets(df, lookahead, tp, sl):
+    targets = []
+    close_prices = df['Close'].values
+    n_samples = len(close_prices)
+    
+    for i in range(n_samples):
+        if i + lookahead >= n_samples:
+            targets.append(np.nan)
+            continue
+            
+        entry_price = close_prices[i]
+        label = 0 
+        for j in range(1, lookahead + 1):
+            future_price = close_prices[i + j]
+            ret = (future_price - entry_price) / entry_price
+            if ret <= sl:
+                label = 0 
+                break
+            elif ret >= tp:
+                label = 1 
+                break
+        targets.append(label)
+        
+    df_out = df.copy()
+    df_out['Target'] = targets
+    return df_out.replace([np.inf, -np.inf], np.nan).dropna()
+
+def auto_optimize_ticker(ticker_name, df_stock, df_vnindex):
+    df = pd.merge(df_stock, df_vnindex, left_index=True, right_index=True, how='inner')
+    if len(df) < 100: return None
+    
+    df = calculate_features(df)
+    
+    feature_cols = [
+        'Log_Return', 'RSI_14', 'Momentum_14', 'Volatility', 'Volume', 
+        'MACD_Hist_Custom', 'EMA_13_21_Cross', 'Dist_EMA_13',
+        'Dist_BB_Upper', 'Dist_BB_Lower',
+        'VN_Return', 'VN_Volatility', 'Relative_Strength', 'RS_Trend', 'Market_Distance_EMA',
+        'Foreign_Net_5D', 'Foreign_Net_20D_Mean', 'Foreign_Mutation'
+    ]
+    
+    best_score = -1
+    best_params = {'LOOKAHEAD': 30, 'TP': 0.05, 'SL': -0.05, 'THRESH': 0.60, 'PRECISION': 0.0, 'TRADES': 0} 
+    
+    total_iterations = len(GRID_LOOKAHEAD) * len(GRID_TP) * len(GRID_SL) * len(GRID_THRESH)
+    current_iter = 0
+    print(f"    -> Đang chạy Walk-Forward Validation {CV_SPLITS} bước trên {total_iterations} kịch bản...")
+    
+    tscv = TimeSeriesSplit(n_splits=CV_SPLITS)
+    
+    for la in GRID_LOOKAHEAD:
+        for tp in GRID_TP:
+            for sl in GRID_SL:
+                df_temp = calculate_targets(df, la, tp, sl)
+                if len(df_temp) < 100: 
+                    current_iter += len(GRID_THRESH)
+                    continue
+                
+                X = df_temp[feature_cols].values
+                y = df_temp['Target'].values
+                thresh_scores = {t: {'prec_sum': 0, 'trades_sum': 0, 'valid_folds': 0} for t in GRID_THRESH}
+                
+                for train_idx, test_idx in tscv.split(X):
+                    X_train_raw, X_test_raw = X[train_idx], X[test_idx]
+                    y_train, y_test = y[train_idx], y[test_idx]
+                    
+                    scaler = StandardScaler()
+                    X_train = scaler.fit_transform(X_train_raw)
+                    X_test = scaler.transform(X_test_raw)
+                    
+                    pos_cases = np.sum(y_train == 1)
+                    scale_pos = np.sum(y_train == 0) / pos_cases if pos_cases > 0 else 1
+                    
+                    model = xgb.XGBClassifier(n_estimators=N_ESTIMATORS, max_depth=MAX_DEPTH, 
+                                              learning_rate=LEARNING_RATE, scale_pos_weight=scale_pos, 
+                                              random_state=42, eval_metric='logloss', n_jobs=-1)
+                    try: model.fit(X_train, y_train)
+                    except: continue
+                        
+                    probs = model.predict_proba(X_test)[:, 1]
+                    for thresh in GRID_THRESH:
+                        preds = (probs >= thresh).astype(int)
+                        num_trades = np.sum(preds == 1)
+                        if num_trades > 0:
+                            prec = precision_score(y_test, preds, zero_division=0)
+                            thresh_scores[thresh]['prec_sum'] += prec
+                            thresh_scores[thresh]['trades_sum'] += num_trades
+                            thresh_scores[thresh]['valid_folds'] += 1
+                
+                for thresh in GRID_THRESH:
+                    current_iter += 1
+                    stats = thresh_scores[thresh]
+                    if stats['valid_folds'] > 0:
+                        avg_prec = stats['prec_sum'] / stats['valid_folds']
+                        total_trades = stats['trades_sum']
+                        if total_trades >= MIN_TRADES_REQUIRED:
+                            score = avg_prec + (total_trades * 0.001) 
+                            if score > best_score:
+                                best_score = score
+                                best_params = {'LOOKAHEAD': la, 'TP': tp, 'SL': sl, 'THRESH': thresh, 'PRECISION': avg_prec, 'TRADES': total_trades}
+                    
+                    if current_iter % 50 == 0 or current_iter == total_iterations:
+                        print(f"      [Tiến độ: {current_iter}/{total_iterations}] WFV Tốt nhất: {best_params['LOOKAHEAD']}D | Lãi {int(best_params['TP']*100)}% | Lỗ {int(best_params['SL']*100)}% - Uy tín: {best_params['PRECISION']*100:.1f}%")
+    
+    if best_score == -1: return 0, 0, None, best_params
+
+    # Huấn luyện lần cuối để lấy model và vẽ Chart
+    final_la = best_params['LOOKAHEAD']
+    final_tp = best_params['TP']
+    final_sl = best_params['SL']
+    final_thresh = best_params['THRESH']
+    
+    df_final = calculate_targets(df, final_la, final_tp, final_sl)
+    X = df_final[feature_cols].values
+    y = df_final['Target'].values
+    train_size = int(len(df_final) * 0.8)
+    
+    X_train_raw, X_test_raw = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
+    close_test = df_final['Close'].values[train_size:]
+    
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train_raw)
+    X_test = scaler.transform(X_test_raw)
+    
+    pos_cases = np.sum(y_train == 1)
+    scale_pos = np.sum(y_train == 0) / pos_cases if pos_cases > 0 else 1
+    
+    final_model = xgb.XGBClassifier(n_estimators=N_ESTIMATORS, max_depth=MAX_DEPTH, 
+                                    learning_rate=LEARNING_RATE, scale_pos_weight=scale_pos, 
+                                    random_state=42, eval_metric='logloss', n_jobs=-1)
+    final_model.fit(X_train, y_train)
+    
+    probs = final_model.predict_proba(X_test)[:, 1] 
+    predictions = (probs >= final_thresh).astype(int)
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), gridspec_kw={'height_ratios': [2, 1]})
+    ax1.plot(df_final.index[train_size:], close_test, label=f'Giá {ticker_name}', color='dimgray', linewidth=1.5, alpha=0.7)
+    
+    buy_signals_idx = np.where(predictions == 1)[0]
+    win_idx = [idx for idx in buy_signals_idx if y_test[idx] == 1] 
+    loss_idx = [idx for idx in buy_signals_idx if y_test[idx] == 0] 
+    
+    if win_idx: ax1.scatter(df_final.index[train_size:][win_idx], close_test[win_idx], marker='^', color='limegreen', s=150, label=f'✅ MUA ĐÚNG ({len(win_idx)} lệnh)', zorder=5)
+    if loss_idx: ax1.scatter(df_final.index[train_size:][loss_idx], close_test[loss_idx], marker='X', color='red', s=120, label=f'❌ MUA SAI ({len(loss_idx)} lệnh)', zorder=5)
+    
+    ax1.set_title(f"ĐÁNH GIÁ CHIẾN THUẬT AI - MÃ {ticker_name}\n(Giữ {final_la} Ngày | Lãi: {int(final_tp*100)}% | Lỗ: {int(final_sl*100)}% | Uy tín: {best_params.get('PRECISION', 0)*100:.1f}%)", fontsize=14, fontweight='bold')
+    ax1.legend(loc='best'); ax1.grid(True, linestyle='--', alpha=0.5)
+    
+    importances = final_model.feature_importances_
+    sorted_idx = np.argsort(importances)
+    feature_names_vn = {
+        'Log_Return': 'Biến động giá (Log)', 'RSI_14': 'RSI (14 Ngày)', 
+        'Momentum_14': 'Động lượng Momentum (14 Ngày)', 
+        'Volatility': 'Độ nhiễu/Biến động', 'Volume': 'Khối lượng Giao dịch', 
+        'MACD_Hist_Custom': 'Động lượng MACD(10,50,100)', 
+        'EMA_13_21_Cross': 'Giao cắt EMA(13,21)',
+        'Dist_EMA_13': 'Khoảng cách Giá đến EMA13',
+        'Dist_BB_Upper': 'K/c đến Bollinger Trên', 'Dist_BB_Lower': 'K/c đến Bollinger Dưới', 
+        'VN_Return': 'Biến động VN-Index', 'VN_Volatility': 'Độ nhiễu VN-Index', 
+        'Relative_Strength': 'Sức mạnh tương đối (vs VN-Index)', 
+        'RS_Trend': 'Xu hướng Sức mạnh', 'Market_Distance_EMA': 'K/c VN-Index đến EMA20',
+        'Foreign_Net_5D': 'Khối ngoại Gom/Xả 5 Ngày', 'Foreign_Net_20D_Mean': 'Khối ngoại Gom/Xả 20 Ngày', 
+        'Foreign_Mutation': 'Đột biến Khối ngoại'
+    }
+    
+    sorted_features = [feature_names_vn.get(feature_cols[i], feature_cols[i]) for i in sorted_idx]
+    bars = ax2.barh(range(len(sorted_idx)), importances[sorted_idx], color='dodgerblue', alpha=0.8)
+    ax2.set_yticks(range(len(sorted_idx)))
+    ax2.set_yticklabels(sorted_features)
+    ax2.set_title("GIẢI PHẪU XAI - CÁC CHỈ BÁO QUYẾT ĐỊNH ĐIỂM MUA TỐT NHẤT", fontsize=12, fontweight='bold')
+    ax2.grid(True, axis='x', linestyle='--', alpha=0.5)
+    for bar in bars: ax2.text(bar.get_width(), bar.get_y() + bar.get_height()/2, f' {bar.get_width()*100:.1f}%', va='center')
+
+    plt.tight_layout()
+    chart_filename = f"{ticker_name}_Eval_Chart.png"
+    plt.savefig(chart_filename)
+    plt.close()
+    
+    last_features = scaler.transform([df_final[feature_cols].iloc[-1].values])
+    return final_model.predict_proba(last_features)[0, 1], best_params.get('PRECISION', 0.0), chart_filename, best_params
+
+def main():
+    print("="*115)
+    print("🚀 HỆ THỐNG RADAR V16 - MACD(10,50,100) & KELLY POSITION SIZING 🚀")
+    print("="*115)
+    
+    print("[*] Đang nạp dữ liệu VN-Index làm hệ quy chiếu...")
+    df_vnindex = load_data(VNINDEX_FILE, is_vnindex=True)
+    if df_vnindex is None: return
+    
+    scan_results = []
+    
+    for file_path in STOCK_FILES:
+        ticker = os.path.basename(file_path).replace('.csv', '').upper()
+        print(f"\n[+] Đang phân tích & tối ưu mã: {ticker}")
+        
+        df_stock = load_data(file_path, is_vnindex=False)
+        if df_stock is None: continue
+        
+        res = auto_optimize_ticker(ticker, df_stock, df_vnindex)
+        if res is None or res[2] is None: continue
+            
+        prob, precision, chart, best_params = res
+        print(f"    -> Đã xuất bản đồ Giá & Giải phẫu XAI: {chart}")
+        
+        action = "BÓP CÒ" if prob >= best_params['THRESH'] else "ĐỨNG NGOÀI"
+        
+        # --- TÍNH TOÁN CÔNG THỨC KELLY ---
+        W = precision
+        R = best_params['TP'] / abs(best_params['SL']) if best_params['SL'] != 0 else 0
+        kelly_pct = W - ((1 - W) / R) if R > 0 else 0
+        
+        half_kelly = (kelly_pct / 2) * 100
+        
+        if action == "ĐỨNG NGOÀI" or half_kelly <= 0:
+            allocation = "0% (Bỏ qua)"
+        else:
+            allocation = f"{half_kelly:.1f}% Vốn"
+        # ---------------------------------
+
+        scan_results.append({
+            'Mã': ticker,
+            'Độ tin cậy': f"{precision*100:.1f}%",
+            'X.Suất Tín Hiệu': f"{prob*100:.2f}%",
+            'Bộ Gen (Lãi/Lỗ)': f"{best_params['LOOKAHEAD']}D / {int(best_params['TP']*100)}% / {int(best_params['SL']*100)}%",
+            'Số lệnh Test': best_params['TRADES'],
+            'HÀNH ĐỘNG': action,
+            'ĐIỀU QUÂN (Kelly)': allocation
+        })
+
+    print("\n" + "="*115)
+    print(" BÁO CÁO TÁC CHIẾN TỔNG HỢP (KÈM QUẢN TRỊ VỐN TỐI ƯU)")
+    print("="*115)
+    
+    if scan_results:
+        results_df = pd.DataFrame(scan_results)
+        results_df = results_df.sort_values(by='X.Suất Tín Hiệu', ascending=False)
+        print(results_df.to_string(index=False))
+    print("="*115)
+
+if __name__ == "__main__":
+    main()
