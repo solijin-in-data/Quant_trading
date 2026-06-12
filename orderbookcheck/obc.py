@@ -1,157 +1,207 @@
 import pandas as pd
-from bs4 import BeautifulSoup
-import numpy as np
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side as OpSide
+from openpyxl.utils import get_column_letter
 import re
+import os
+from datetime import datetime
 
-def parse_and_analyze_fireant(file_path):
-    print("=== BƯỚC 1: ĐANG ĐỌC VÀ BÓC TÁCH DỮ LIỆU HTML ===")
+# =========================================================================
+# CẤU HÌNH THÔNG TIN
+# =========================================================================
+SYMBOL = "CTD"
+FOLDER_PATH = r"C:\Users\tuana\OneDrive\Documents\GitHub\Quant_trading\orderbookcheck\data"
+INPUT_FILE_NAME = "CTD_6_12_2026.txt" # Tên file data bạn đã cào được
+# =========================================================================
+
+def parse_and_analyze():
+    file_path = os.path.join(FOLDER_PATH, INPUT_FILE_NAME)
+    print(f"=== BƯỚC 1: ĐANG ĐỌC VÀ BÓC TÁCH DỮ LIỆU TỪ: {INPUT_FILE_NAME} ===")
     
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             html_content = f.read()
     except FileNotFoundError:
-        print(f"❌ KHÔNG TÌM THẤY FILE TẠI ĐƯỜNG DẪN: {file_path}")
+        print(f"❌ KHÔNG TÌM THẤY FILE: {file_path}")
         return None
-        
-    soup = BeautifulSoup(html_content, "html.parser")
-    
-    # Tìm tất cả các hàng lệnh dựa trên class list-row đặc trưng
-    rows = soup.select('div[class*="list-row"]')
+
+    # Thuật toán quét HTML
+    pattern = r'class="list-row[^"]*".*?<div style="display: flex; flex-direction: row; flex: 1 1 0%;">(.*?)<\/div><\/div><\/div>'
+    matches = re.findall(pattern, html_content, re.DOTALL)
+    if not matches:
+        pattern = r'<div style="display: flex; flex-direction: row; flex: 1 1 0%;">(.*?)<\/div><\/div><\/div>'
+        matches = re.findall(pattern, html_content, re.DOTALL)
     
     records = []
-    
-    for row in rows:
-        # Lấy tất cả các thẻ div con sâu nhất chứa text trực tiếp (ô dữ liệu)
-        cells = [div for div in row.find_all("div") if div.text.strip() and not div.find("div")]
-        
-        # Lọc bỏ trùng lặp text liên tiếp do cấu trúc lồng
-        unique_cells = []
-        for c in cells:
-            t = c.text.strip()
-            if not unique_cells or t != unique_cells[-1]['text']:
-                unique_cells.append({'text': t, 'element': c})
-        
-        # Một dòng chuẩn trên FireAnt luôn bóc ra được đúng 5 thông số
-        if len(unique_cells) >= 5:
-            time_val = unique_cells[0]['text']
-            price_val = unique_cells[1]['text']
-            change_val = unique_cells[2]['text']
-            volume_val = unique_cells[3]['text']
-            side_raw = unique_cells[4]['text']
-            
-            # KIỂM TRA ĐIỀU KIỆN AN TOÀN: Cột đầu tiên bắt buộc phải là định dạng Thời gian HH:MM:SS
+    for block in matches:
+        divs = re.findall(r'<div[^>]*color:\s*rgb\(([^)]+)\)[^>]*>([^<]+)</div>|<div[^>]*>([^<]+)</div>', block)
+        parsed_divs = []
+        for match in divs:
+            color = match[0] if match[0] else ""
+            text = match[1].strip() if match[1] else match[2].strip()
+            if text:
+                parsed_divs.append({"text": text, "color": color})
+                
+        if len(parsed_divs) >= 4:
+            time_val = parsed_divs[0]["text"]
             if re.match(r'^\d{2}:\d{2}:\d{2}$', time_val):
-                # Chuẩn hóa Side (S của FireAnt là xanh -> BUY, B của FireAnt là đỏ -> SELL)
-                if side_raw == 'S':
+                price_val = parsed_divs[1]["text"]
+                change_val = parsed_divs[2]["text"]
+                volume_val = parsed_divs[3]["text"]
+                price_color = parsed_divs[1]["color"]
+                side_raw = parsed_divs[4]["text"] if len(parsed_divs) >= 5 else ""
+                
+                if '0, 170, 0' in price_color or side_raw in ['S', 'M']:
                     side = 'BUY'
-                elif side_raw == 'B':
+                elif '238, 84, 66' in price_color or side_raw == 'B':
                     side = 'SELL'
                 else:
-                    side = 'UNKNOWN'
+                    side = 'ATC/ATO'
                     
                 records.append({
-                    "Time": time_val,
-                    "Price": price_val,
-                    "Change": change_val,
-                    "Volume": volume_val,
-                    "Side": side
+                    "Time": time_val, "Price": price_val, 
+                    "Change": change_val, "Volume": volume_val, "Side": side
                 })
 
     df = pd.DataFrame(records)
-    
-    # PHƯƠNG ÁN DỰ PHÒNG 2: Nếu bộ lọc class thất bại, quét thô toàn bộ cấu trúc file dựa trên định dạng Giờ
     if df.empty:
-        print("⚠️ Chuyển sang phương án quét thô tối ưu vị trí...")
-        all_divs = [d for d in soup.find_all("div") if d.text.strip() and not d.find("div")]
-        records_backup = []
-        
-        i = 0
-        while i < len(all_divs) - 4:
-            # Tìm ô có định dạng thời gian
-            if re.match(r'^\d{2}:\d{2}:\d{2}$', all_divs[i].text.strip()):
-                # Kiểm tra xem các ô tiếp theo có khớp cấu trúc (Giá, Biến động, Khối lượng, Side) không
-                try:
-                    time_v = all_divs[i].text.strip()
-                    price_v = all_divs[i+1].text.strip()
-                    change_v = all_divs[i+2].text.strip()
-                    vol_v = all_divs[i+3].text.strip()
-                    side_v = all_divs[i+4].text.strip()
-                    
-                    if side_v in ['B', 'S'] and ',' in vol_v or vol_v.isdigit():
-                        records_backup.append({
-                            "Time": time_v, "Price": price_v, "Change": change_v, 
-                            "Volume": vol_v, "Side": 'BUY' if side_v == 'S' else 'SELL'
-                        })
-                        i += 5 # Nhảy qua hàng này
-                        continue
-                except:
-                    pass
-            i += 1
-        df = pd.DataFrame(records_backup)
-        
-    if df.empty:
-        print("❌ Thất bại hoàn toàn. Không thể nhận diện cấu trúc file HTML.")
+        print("❌ Cấu trúc HTML trống.")
         return None
         
-    # Loại bỏ các dòng trùng lặp 
     df = df.drop_duplicates(subset=["Time", "Price", "Volume", "Side"]).reset_index(drop=True)
+    df = df.iloc[::-1].reset_index(drop=True) 
     
-    # Đảo ngược để dữ liệu chạy xuôi dòng thời gian từ sáng tới chiều
-    df = df.iloc[::-1].reset_index(drop=True)
-    
-    # CHUẨN HÓA SỐ LIỆU (Có xử lý an toàn lỗi chuỗi)
     df["Price"] = df["Price"].astype(str).str.replace(",", "", regex=False)
     df["Price"] = pd.to_numeric(df["Price"], errors='coerce')
-    
     df["Volume"] = df["Volume"].astype(str).str.replace(",", "", regex=False).str.replace(".", "", regex=False)
     df["Volume"] = pd.to_numeric(df["Volume"], errors='coerce').fillna(0).astype(int)
-    
-    # Loại bỏ các dòng lỗi data nếu có
     df = df.dropna(subset=["Price"]).reset_index(drop=True)
     
-    print(f"✅ Đã trích xuất thành công {len(df)} lệnh khớp sạch từ file HTML.")
-    print("\n--- XEM TRƯỚC 5 LỆNH ĐẦU TIÊN TRONG PHIÊN ---")
-    print(df.head().to_string())
-    
+    print(f"✅ Đã bóc tách thành công {len(df)} lệnh khớp sạch của mã {SYMBOL}!")
+
     # =========================================================================
-    print("\n=== BƯỚC 2: BOT ĐANG PHÂN TÍCH BẤT THƯỜNG SỔ LỆNH ===")
+    # PHẦN MỚI: BOT PHÂN TÍCH ĐỊNH LƯỢNG (QUANTITATIVE ANALYSIS)
+    # =========================================================================
+    print("\n" + "="*60)
+    print(f"📊 BÁO CÁO PHÂN TÍCH DÒNG TIỀN MÃ {SYMBOL} 📊")
+    print("="*60)
+
+    # 1. Thống kê Áp lực Mua / Bán
+    total_buy = df[df['Side'] == 'BUY']['Volume'].sum()
+    total_sell = df[df['Side'] == 'SELL']['Volume'].sum()
+    total_atc = df[df['Side'] == 'ATC/ATO']['Volume'].sum()
+    total_vol = df['Volume'].sum()
+
+    buy_pct = (total_buy / total_vol) * 100 if total_vol > 0 else 0
+    sell_pct = (total_sell / total_vol) * 100 if total_vol > 0 else 0
+
+    print(f"🔹 1. TỔNG QUAN CUNG CẦU CHỦ ĐỘNG:")
+    print(f"   - Tổng khối lượng khớp: {total_vol:,.0f} CP")
+    print(f"   - 🟢 MUA chủ động:      {total_buy:,.0f} CP ({buy_pct:.1f}%)")
+    print(f"   - 🔴 BÁN chủ động:      {total_sell:,.0f} CP ({sell_pct:.1f}%)")
     
-    # 1. Thuật toán quét LỆNH CÁ MẬP (IQR)
-    q3 = df["Volume"].quantile(0.75)
-    iqr = q3 - df["Volume"].quantile(0.25)
-    whale_threshold = q3 + 3 * iqr
-    whale_threshold = max(whale_threshold, df["Volume"].median() * 10)
-    
-    whale_trades = df[df["Volume"] >= whale_threshold]
-    
-    print(f"📌 Ngưỡng lệnh CÁ MẬP tự động xác định: >= {whale_threshold:,.0f} CP/lệnh")
-    print(f"🚨 Phát hiện {len(whale_trades)} lệnh Cá mập hành động:")
-    if not whale_trades.empty:
-        print(whale_trades[["Time", "Price", "Volume", "Side"]].to_string(index=False))
+    net_vol = total_buy - total_sell
+    if net_vol > 0:
+        print(f"   => KẾT LUẬN: Phe MUA đang áp đảo, bơm ròng +{net_vol:,.0f} CP vào thị trường.")
+    elif net_vol < 0:
+        print(f"   => KẾT LUẬN: Phe BÁN đang xả hàng, rút ròng {net_vol:,.0f} CP khỏi thị trường.")
     else:
-        print("=> Không có lệnh cá mập nào vượt ngưỡng.")
-        
-    # 2. Thuật toán quét HFT ROBOT QUAY TAY (Trùng khít Giờ-Giá-Vol)
-    df['Is_Abnormal_HFT'] = (df['Volume'] == df['Volume'].shift(1)) & \
-                             (df['Price'] == df['Price'].shift(1)) & \
-                             (df['Time'] == df['Time'].shift(1))
-                             
-    hft_trades = df[df['Is_Abnormal_HFT'] == True]
-    print(f"\n🚨 Phát hiện {len(hft_trades)} lệnh có dấu hiệu ROBOT QUAY TAY:")
-    if not hft_trades.empty:
-        print(hft_trades[["Time", "Price", "Volume", "Side"]].head(10).to_string(index=False))
-        if len(hft_trades) > 10:
-            print(f"... và {len(hft_trades) - 10} lệnh tương tự khác.")
-    else:
-        print("=> Sổ lệnh sạch, không phát hiện robot quay tay.")
-        
-    # Lưu file kết quả sạch ra ổ D
-    output_path = r"D:\Python\fireant_ticks_analyzed.csv"
-    df.to_csv(output_path, index=False)
-    print(f"\n💾 Đã phân tích xong và lưu bảng dữ liệu sạch vào: {output_path}")
+        print(f"   => KẾT LUẬN: Cung cầu đang giằng co cân bằng.")
+
+    # 2. Phân tích vùng giá tập trung (Point of Control)
+    print(f"\n🔹 2. HỒ SƠ KHỐI LƯỢNG (Top 3 Vùng giá giao dịch nhiều nhất):")
+    vol_by_price = df.groupby('Price')['Volume'].sum().sort_values(ascending=False).head(3)
+    for price, vol in vol_by_price.items():
+        print(f"   - Mức giá {price}: {vol:,.0f} CP")
+
+    # 3. Radar Quét Cá Mập (Lấy Top 5% lệnh to nhất hoặc các lệnh trên ngưỡng cố định)
+    # Thuật toán tính ngưỡng: Lấy phân vị 95% (95th percentile)
+    whale_threshold = df['Volume'].quantile(0.95)
+    whales = df[df['Volume'] >= whale_threshold]
     
+    print(f"\n🔹 3. RADAR CÁ MẬP (Lọc các lệnh Đột biến >= {whale_threshold:,.0f} CP):")
+    if not whales.empty:
+        print(f"   🚨 CẢNH BÁO: Phát hiện {len(whales)} lệnh siêu lớn!")
+        # Sắp xếp để xem lệnh to nhất
+        whales_sorted = whales.sort_values(by='Volume', ascending=False).head(10) 
+        for idx, row in whales_sorted.iterrows():
+            icon = "🟢 MUA" if row['Side'] == 'BUY' else "🔴 BÁN" if row['Side'] == 'SELL' else "⚪ ATC/ATO"
+            print(f"      [{row['Time']}] {icon} tấp tay {row['Volume']:,.0f} CP ở giá {row['Price']}")
+        if len(whales) > 10:
+            print(f"      ... (và {len(whales) - 10} lệnh cá mập khác được lưu trong Excel)")
+    else:
+        print("   - Không phát hiện lệnh cá mập bất thường. Thị trường chủ yếu là lệnh nhỏ lẻ.")
+    
+    print("="*60 + "\n")
+
+    # =========================================================================
+    print("=== BƯỚC 3: TỰ ĐỘNG KHỞI TẠO VÀ FORMAT FILE EXCEL ===")
+    
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Sổ Lệnh {SYMBOL}"
+    ws.views.sheetView[0].showGridLines = True
+    
+    headers = ["Thời Gian", "Giá Khớp", "Biến Động", "Khối Lượng", "Bên Chủ Động", "Giá Trị Khớp (VND)"]
+    ws.append(headers)
+    
+    for index, row in df.iterrows():
+        ws.append([row["Time"], row["Price"], row["Change"], row["Volume"], row["Side"], ""])
+        r_num = index + 2
+        ws[f"F{r_num}"] = f"=B{r_num}*1000*D{r_num}"
+        
+    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    center_align = Alignment(horizontal="center", vertical="center")
+    right_align = Alignment(horizontal="right", vertical="center")
+    
+    thin_border = Border(
+        left=OpSide(style='thin', color='D9D9D9'), right=OpSide(style='thin', color='D9D9D9'),
+        top=OpSide(style='thin', color='D9D9D9'), bottom=OpSide(style='thin', color='D9D9D9')
+    )
+    
+    buy_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")  
+    sell_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid") 
+    atc_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  
+    
+    for col_num in range(1, 7):
+        cell = ws.cell(row=1, column=col_num)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_align
+        
+    for r_idx in range(2, ws.max_row + 1):
+        side_val = ws[f"E{r_idx}"].value
+        current_fill = buy_fill if side_val == "BUY" else sell_fill if side_val == "SELL" else atc_fill
+        
+        ws[f"A{r_idx}"].alignment = center_align
+        ws[f"B{r_idx}"].alignment = right_align
+        ws[f"B{r_idx}"].number_format = '#,##0.00'
+        ws[f"C{r_idx}"].alignment = right_align
+        ws[f"C{r_idx}"].number_format = '#,##0.00'
+        ws[f"D{r_idx}"].alignment = right_align
+        ws[f"D{r_idx}"].number_format = '#,##0'
+        ws[f"E{r_idx}"].alignment = center_align
+        ws[f"F{r_idx}"].alignment = right_align
+        ws[f"F{r_idx}"].number_format = '#,##0'
+        
+        for c_idx in range(1, 7):
+            cell = ws.cell(row=r_idx, column=c_idx)
+            cell.fill = current_fill
+            cell.border = thin_border
+            
+    for col in ws.columns:
+        max_len = max(len(str(cell.value or '')) for cell in col)
+        col_letter = get_column_letter(col[0].column)
+        ws.column_dimensions[col_letter].width = max(max_len + 4, 14)
+        
+    # Thêm HHMMSS vào tên file để không bao giờ bị lỗi ghi đè (Permission Denied) nếu đang mở Excel
+    date_str = datetime.now().strftime("%d_%m_%Y_%H%M%S")
+    output_excel = os.path.join(FOLDER_PATH, f"{SYMBOL}_{date_str}.xlsx")
+    
+    wb.save(output_excel)
+    print(f"🚀 THÀNH CÔNG RỰC RỠ! ĐÃ XUẤT FILE EXCEL TẠI: {output_excel}")
     return df
 
-# --- CHẠY BOT ---
-file_name = r"D:\Python\fireant_source.html"
-df_clean = parse_and_analyze_fireant(file_name)
+if __name__ == "__main__":
+    parse_and_analyze()
