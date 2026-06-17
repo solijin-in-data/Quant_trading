@@ -9,7 +9,7 @@ from datetime import datetime
 # ==============================================================================
 # 1. CẤU HÌNH THÔNG SỐ (Token của bạn đã được cập nhật ở đây)
 # ==============================================================================
-JWT_TOKEN = "eyJhbGciOiJSUzI1NiIsIng1YyI6WyJNSUlDNmpDQ0FkS2dBd0lCQWdJR0FZOEFGNGhRTUEwR0NTcUdTSWIzRFFFQkN3VUFNRFl4TkRBeUJnTlZCQU1NSzA1eU9FSnVlSFJ5YlhrMlJGb3lWa05hTlRWcGNtUXlaRTlLZG1relFsbFJXRFpRV0doUE1VWkRSkFdG...[đoạn giữa cắt bớt cho gọn]...t-nq0JOMRg_0itGcyVNqsVg" 
+JWT_TOKEN = "" 
 SYMBOL = "CTD"
 
 NEGOTIATE_URL = "https://wl-realtime.fiintrade.vn/RealtimeHub/negotiate?negotiateVersion=1"

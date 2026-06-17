@@ -3,7 +3,7 @@ from vnstock.api.quote import Quote
 import pandas as pd
 
 # Khai báo API Key của bạn
-register_user(api_key="vnstock_083866c9884986cb1c3b5c34734efb12")
+register_user(api_key="")
 
 # Danh sách các nguồn hỗ trợ tốt trong v4.x để chạy vòng lặp dự phòng
 cac_nguon_thu_nghiem = ['dnse', 'kbs']
