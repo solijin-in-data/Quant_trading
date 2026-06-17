@@ -1,0 +1,6 @@
+# Chặn đích danh file key.env của bạn
+key.env
+
+# Chặn luôn tất cả các file có đuôi .env khác đề phòng sau này tạo thêm
+*.env
+.env
