@@ -4,37 +4,17 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import numpy as np
 
-# ==============================================================================
-# CẤU HÌNH MÃ CỔ PHIẾU BẠN MUỐN THEO DÕI TRÊN BIỂU ĐỒ 3D
-# ==============================================================================
-SYMBOL_TO_PLOT = "FPT"  # <--- Thay đổi mã bạn muốn xem tại đây (CTD, FPT, SSI...)
-
 # Thiết lập giao diện figure 3D
 fig = plt.figure(figsize=(12, 8))
 ax = fig.add_subplot(111, projection='3d')
 
 def update_3d(frame):
-    # Sử dụng chế độ read-only (uri=True) để hoàn toàn không chặn luồng ghi của Bot chính
-    try:
-        conn = sqlite3.connect("file:market_data.db?mode=ro", uri=True)
-        
-        # 🔥 ĐÃ SỬA SQL: Lọc chính xác theo SYMBOL và tận dụng INDEX kép để tăng tốc
-        query = """
-            SELECT * FROM order_book 
-            WHERE symbol = ? 
-            ORDER BY timestamp DESC, id DESC 
-            LIMIT 15
-        """
-        df = pd.read_sql_query(query, conn, params=(SYMBOL_TO_PLOT,))
-        conn.close()
-    except Exception as e:
-        print(f"[RECOVERY] DB đang bận, sẽ thử lại ở giây kế tiếp... Chi tiết: {e}")
-        return
-
-    if df.empty or len(df) < 2: 
-        ax.cla()
-        ax.text2D(0.5, 0.5, f"Chưa có đủ dữ liệu cho mã: {SYMBOL_TO_PLOT}", transform=ax.transAxes, ha="center")
-        return
+    conn = sqlite3.connect("market_data.db")
+    # Lấy 15 nhịp gần nhất để giữ đồ thị trực quan và mượt mà
+    df = pd.read_sql_query("SELECT * FROM order_book ORDER BY id DESC LIMIT 15", conn)
+    conn.close()
+    
+    if df.empty: return
 
     # 🔥 GIỮ GÓC XOAY: Lưu lại góc nhìn hiện tại do chuột của bạn đang giữ
     current_elev = ax.elev if ax.elev is not None else 25
@@ -71,11 +51,11 @@ def update_3d(frame):
     for i in range(len(df)):      # Chạy qua từng nhịp thời gian (Trục Y)
         for j in range(10):       # Chạy qua 10 bước giá (Trục X)
             v_size = Z[i, j]
-            if v_size == 0 or np.isnan(v_size): continue # Bỏ qua ô trống hoặc NaN để tối ưu CPU
+            if v_size == 0: continue # Bỏ qua ô trống để tối ưu CPU
             
             # Phân tách màu sắc:
-            # j < 5 là phe Mua (Bids) -> Màu Xanh lá
-            # j >= 5 là phe Bán (Asks) -> Màu Đỏ
+            # j < 5 là phe Mua (Bids) -> Màu Xanh lá (Tường càng dày màu càng sáng)
+            # j >= 5 là phe Bán (Asks) -> Màu Đỏ (Tường càng dày màu càng rực)
             if j < 5:
                 c = '#00FF00' if v_size > 20000 else ('#32CD32' if v_size > 5000 else '#006400')
             else:
@@ -86,15 +66,15 @@ def update_3d(frame):
 
     # BƯỚC 4: Định cấu hình các trục và đè nhãn giá thực tế
     ax.set_xticks(range(10))
-    # Định dạng hiển thị giá có dấu phẩy ngăn cách
+    # Định dạng hiển thị giá có dấu phẩy ngăn cách (ví dụ: 72,400)
     ax.set_xticklabels([f"{p:,.0f}" if p and not np.isnan(p) else "" for p in prices_x], rotation=15, fontsize=8)
     
     # Giới hạn trục Y theo số nhịp dữ liệu đang hiển thị
     ax.set_yticks(range(len(df)))
     ax.set_yticklabels(range(len(df)))
 
-    # Đặt tên nhãn trực quan (Đã bổ sung tên mã hiển thị)
-    ax.set_title(f"Real-time 3D Order Book Depth - Cổ phiếu: {SYMBOL_TO_PLOT}", fontsize=12, fontweight='bold')
+    # Đặt tên nhãn trực quan
+    ax.set_title("Real-time 3D Order Book Depth (Bid/Ask Split View)", fontsize=12, fontweight='bold')
     ax.set_xlabel("Mức Giá Thực Tế (Bids bên trái | Asks bên phải)", fontsize=9, labelpad=10)
     ax.set_ylabel("Thời gian (Nhịp lùi về quá khứ)", fontsize=9)
     ax.set_zlabel("Khối lượng (Volume)", fontsize=9)
@@ -102,7 +82,7 @@ def update_3d(frame):
     # 🔥 KHÓA GÓC NHÌN: Ép đồ thị nhịp mới phải tuân theo góc xoay chuột hiện tại của bạn
     ax.view_init(elev=current_elev, azim=current_azim)
 
-# Cập nhật livetime tốc độ 1000ms (1 giây)
+# Cập nhật livetime GIỮ NGUYÊN tốc độ 1000ms (1 giây) theo yêu cầu
 ani = FuncAnimation(fig, update_3d, interval=1000, cache_frame_data=False)
 plt.tight_layout()
 plt.show()
