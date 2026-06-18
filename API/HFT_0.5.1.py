@@ -47,17 +47,25 @@ def init_db():
 # ==============================================================================
 # 2. LAYER 2: MARKET STATE & GARBAGE COLLECTION
 # ==============================================================================
+
+# ==============================================================================
+# 2. LAYER 2: MARKET STATE & GARBAGE COLLECTION
+# ==============================================================================
 class MarketState:
     def __init__(self):
         self.last_price = 0.0
         self.best_bid = 0.0
         self.best_ask = 0.0
         
-        self.price_levels = defaultdict(lambda: {
-            "cvd": 0, 
-            "volume": 0, 
-            "ticks_survived": 0
-        })
+        # TẦNG 1: MEMORY - Lưu trữ Profile/Volume Surface cả ngày
+        self.price_memory = defaultdict(lambda: {"total_vol": 0, "total_cvd": 0})
+        
+        # TẦNG 2: ACTIVE SESSIONS - Quản lý trận chiến (Hấp thụ) hiện tại
+        self.active_sessions = {}
+        
+        # Các thông số thiết lập bộ lọc (Tùy chỉnh cho CTD)
+        self.ACTIVE_ZONE = 5        # Vùng sống sót: 5 bước giá
+        self.VOLUME_THRESHOLD = 1000 # Bỏ qua các lệnh đấm < 1000 cổ để tránh nhiễu
         
         self.current_book = {"bids": {}, "asks": {}}
         self.prev_book = {"bids": {}, "asks": {}}
@@ -69,6 +77,7 @@ class MarketState:
         self.active_walls = {}
 
     def process_trade(self, price, volume):
+        # 1. Tính toán phe chủ động
         aggressor = 0
         if self.best_ask > 0 and self.best_bid > 0:
             if price >= self.best_ask:
@@ -82,48 +91,27 @@ class MarketState:
         else:
             aggressor = 1 if price > self.last_price else (-1 if price < self.last_price else 0)
 
-        level = self.price_levels[price]
-        level["cvd"] += (aggressor * volume)
-        level["volume"] += volume
-        level["ticks_survived"] += 1
+        # 2. LƯU TẦNG 1 (Luôn cộng dồn để vẽ Volume Profile)
+        self.price_memory[price]["total_vol"] += volume
+        self.price_memory[price]["total_cvd"] += (aggressor * volume)
 
-        self.last_price = price
-        return {"type": "TRADE", "price": price, "volume": volume, "aggressor": aggressor}
-
-    def process_book(self, bid_prices, bid_vols, ask_prices, ask_vols):
-        if bid_prices: self.best_bid = bid_prices[0]
-        if ask_prices: self.best_ask = ask_prices[0]
-
-        self.prev_book = self.current_book.copy()
-        self.current_book = {
-            "bids": dict(zip(bid_prices, bid_vols)),
-            "asks": dict(zip(ask_prices, ask_vols))
-        }
+        # 3. QUẢN LÝ TẦNG 2 (Khởi tạo/Cập nhật Session Hấp Thụ)
+        if price not in self.active_sessions:
+            self.active_sessions[price] = {
+                "start_time": time.time(),
+                "cvd": 0,
+                "absorbed_volume": 0,
+                "ticks_survived": 0,
+                "status": "ACTIVE"
+            }
+            
+        session = self.active_sessions[price]
+        session["cvd"] += (aggressor * volume)
+        session["absorbed_volume"] += volume
         
-        weights = [1.0, 0.8, 0.6]
-        w_bid = sum(v * w for v, w in zip(bid_vols[:3], weights[:len(bid_vols)]))
-        w_ask = sum(v * w for v, w in zip(ask_vols[:3], weights[:len(ask_vols)]))
-        total_w = w_bid + w_ask
-        self.wobi = (w_bid - w_ask) / total_w if total_w > 0 else 0.0
-
-        self.book_deltas = {"bids": {}, "asks": {}}
-        if self.prev_book["bids"]:
-            for p in self.current_book["bids"]:
-                old_vol = self.prev_book["bids"].get(p, 0)
-                self.book_deltas["bids"][p] = self.current_book["bids"][p] - old_vol
-            for p in self.current_book["asks"]:
-                old_vol = self.prev_book["asks"].get(p, 0)
-                self.book_deltas["asks"][p] = self.current_book["asks"][p] - old_vol
-                
-        # GARBAGE COLLECTION: Prevent memory leaks by dropping inactive outer price levels
-        if self.best_bid > 0 and self.best_ask > 0:
-            threshold = (self.best_ask - self.best_bid) * 20  
-            for p in list(self.traded_vol_at_bid.keys()):
-                if abs(p - self.best_bid) > threshold: del self.traded_vol_at_bid[p]
-            for p in list(self.traded_vol_at_ask.keys()):
-                if abs(p - self.best_ask) > threshold: del self.traded_vol_at_ask[p]
-
-        return {"type": "BOOK_UPDATE"}
+        # CHỈ tính là 1 nhịp tấn công thực sự nếu volume đủ lớn (Institutional Flow)
+        if volume >= self.VOLUME_THRESHOLD:
+            session["ticks_survived"] += 1
 
 # ==============================================================================
 # 3. LAYER 3: EVENT ENGINE & SIGNAL INTERPRETER

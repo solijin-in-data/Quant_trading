@@ -9,6 +9,30 @@ Tất cả những thay đổi đáng chú ý của dự án này sẽ được 
 - [X] Tích hợp ghi log dữ liệu thô vào SQLite.
 
 
+## [0.6.0] - 2026-06-18
+### 🚀 Nâng cấp hệ thống (Major Update)
+- **Mở rộng Order Book:** Nâng cấp khả năng thu thập dữ liệu từ 3 tầng lên đầy đủ **10 tầng** (Bid/Ask) từ WebSocket.
+- **Tái cấu trúc Database:** - Cập nhật schema bảng `order_book` để lưu trữ 20 cột giá và khối lượng (10 Bid, 10 Ask) thay vì giới hạn như trước.
+    - Chuyển đổi sang phương thức chèn dữ liệu động (`placeholders`) để tối ưu hiệu năng ghi.
+- **Tối ưu hóa xử lý:** - Duy trì logic phân tích HFT hiện tại bằng cách tách biệt dữ liệu: sử dụng 3 mức tốt nhất cho tính toán tín hiệu (Signal Engine) và lưu trữ toàn bộ 10 mức vào SQLite.
+    - Cải thiện độ ổn định khi xử lý chuỗi tin nhắn WebSocket (phân tách ký tự `chr(30)` hiệu quả hơn).
+### 🧠 Nâng cấp tư duy phân tích (Core Engine)
+- **Chuyển đổi sang Notional Value:** Thay thế ngưỡng cố định (`volume > threshold`) bằng `Notional Threshold` (Price × Volume). Điều này giúp bot thích nghi với mọi mã cổ phiếu (ví dụ: CTD) thay vì phải tinh chỉnh thủ công cho từng mã.
+- **Phân tách hành vi dòng lệnh (Deep Flow Analysis):**
+    - Logic cũ bị nhầm lẫn giữa *Hủy lệnh* (Cancel) và *Khớp lệnh* (Consumed).
+    - Cập nhật cơ chế tính toán Delta: `Delta = (Current_Vol - Prev_Vol)`. Nếu `Delta < 0` mà có `Traded_Vol` -> Phân loại chính xác là "Hủy lệnh" hay "Khớp lệnh".
+- **Phát hiện Iceberg/Replenishment:** Thiết lập bộ nhận diện mới: nếu lệnh vừa bị khớp (`Traded_Vol > 0`) mà `Delta` của mức giá đó vẫn tăng -> Xác định là hành vi tiếp tế thanh khoản (Iceberg/Refill).
+- **Reset Logic thông minh:** `ticks_survived` và `absorbed_volume` không còn đếm vô tận mà sẽ tự động `reset` sau khi mức giá đã đạt ngưỡng cảnh báo (Passive Absorption), tránh sai lệch dữ liệu tích lũy.
+
+### 🛠 Cải tiến kỹ thuật
+- **Schema Database:** Mở rộng lên 10 tầng Order Book để phục vụ phân tích sâu.
+- **Tối ưu hóa performance:** Chuyển sang sử dụng `placeholders` cho các câu lệnh SQL INSERT, giảm tải IO cho database.
+- **Kết nối:** Nâng cấp cơ chế `ping/pong` để duy trì WebSocket ổn định trong phiên giao dịch có biến động cao.
+- Tăng cường khả năng chịu lỗi khi parsing dữ liệu WebSocket đầu vào.
+- Cấu trúc lại file để tách biệt rõ ràng giữa logic Database và luồng xử lý thời gian thực.
+- Cập nhật cơ chế `ping_interval` và `ping_timeout` để duy trì kết nối WebSocket bền bỉ hơn trong môi trường mạng không ổn định.
+
+
 ## [0.5.1-Beta] - 2026-06-18
 ### Added
 - Mở rộng cấu trúc lưu trữ cơ sở dữ liệu `order_book` lên đầy đủ 10 tầng (Mua/Bán) đồng thời tự động hóa chuỗi tham số placeholders (`?`) động để tối ưu câu lệnh `INSERT INTO`.
