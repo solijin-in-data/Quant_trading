@@ -27,12 +27,58 @@ custom_headers = [
 ]
 
 # ⚡ HẬU CẦN HFT: Hàng đợi trung chuyển dữ liệu xuống DB
-db_queue = queue.Queue()
+DB_QUEUE_MAXSIZE = 50_000
+DB_CRITICAL_PUT_TIMEOUT = 0.05
+DB_COMMIT_BATCH_SIZE = 100
+ORDERBOOK_SAVE_INTERVAL = 1.0  # Lưu snapshot order book tối đa 1 lần/giây/mã để giảm áp lực DB
+
+db_queue = queue.Queue(maxsize=DB_QUEUE_MAXSIZE)
+last_queue_warning_time = 0.0
+dropped_low_priority_writes = 0
+last_orderbook_saved = defaultdict(float)
+
+def enqueue_db(query, params, priority="normal"):
+    """
+    Đẩy lệnh ghi DB vào queue có giới hạn.
+    - normal: trade/event/outcome quan trọng, chờ rất ngắn nếu queue đầy.
+    - low: dữ liệu nặng như order_book snapshot, được phép bỏ qua khi nghẽn.
+    """
+    global last_queue_warning_time, dropped_low_priority_writes
+    record = (query, params)
+
+    try:
+        db_queue.put_nowait(record)
+        return True
+    except queue.Full:
+        if priority == "low":
+            dropped_low_priority_writes += 1
+            now = time.time()
+            if now - last_queue_warning_time > 5.0:
+                print(f"[DB WARNING] Queue đầy, đã bỏ {dropped_low_priority_writes} bản ghi ưu tiên thấp để bảo vệ RAM.")
+                last_queue_warning_time = now
+            return False
+
+        try:
+            db_queue.put(record, timeout=DB_CRITICAL_PUT_TIMEOUT)
+            return True
+        except queue.Full:
+            dropped_low_priority_writes += 1
+            now = time.time()
+            if now - last_queue_warning_time > 5.0:
+                print("[DB WARNING] Queue vẫn đầy, bỏ 1 bản ghi quan trọng để tránh treo WebSocket.")
+                last_queue_warning_time = now
+            return False
 
 def db_writer_worker():
     """Luồng ngầm duy nhất chuyên trách ghi ổ cứng, giải phóng cho luồng WebSocket"""
-    conn = sqlite3.connect("market_data.db", check_same_thread=False)
+    conn = sqlite3.connect("market_data.db", check_same_thread=False, timeout=30.0)
     cursor = conn.cursor()
+
+    # WAL giúp plotter đọc database trong khi bot vẫn ghi, giảm lỗi "database is locked"
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+    cursor.execute("PRAGMA busy_timeout=3000;")
+    cursor.execute("PRAGMA temp_store=MEMORY;")
     
     # Khởi tạo DB ngay tại luồng này
     cursor.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME, symbol TEXT, price REAL, volume INTEGER, price_change INTEGER, total_volume INTEGER)''')
@@ -49,6 +95,7 @@ def db_writer_worker():
     
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_sym_time ON trades(symbol, timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ob_sym_time ON order_book(symbol, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ob_sym_id ON order_book(symbol, id DESC)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cluster_sym_time ON cluster_metrics(symbol, timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_metrics_sym_time ON trade_metrics(symbol, timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_outcome_sym_time ON outcome_log(symbol, timestamp)")
@@ -63,8 +110,8 @@ def db_writer_worker():
             cursor.execute(query, params)
             batch_counter += 1
             
-            # Gộp các lượt commit lại (Cứ 20 dòng hoặc khi hết hàng đợi thì commit 1 lần để tăng tốc ổ cứng)
-            if batch_counter >= 20 or db_queue.empty():
+            # Gộp các lượt commit lại để giảm áp lực ổ cứng
+            if batch_counter >= DB_COMMIT_BATCH_SIZE or db_queue.empty():
                 conn.commit()
                 batch_counter = 0
                 
@@ -160,11 +207,11 @@ class MarketState:
             session["attack_notional"] += notional
             session["ticks_survived"] += 1
 
-        # ⚡ Thay vì ghi trực tiếp, đẩy vào Queue
-        db_queue.put((
+        # ⚡ Thay vì ghi trực tiếp, đẩy vào Queue có giới hạn
+        enqueue_db(
             'INSERT INTO trade_metrics (timestamp, symbol, price, notional, impact_ratio, regime_ratio, is_attack) VALUES (?, ?, ?, ?, ?, ?, ?)',
             (dt_str, self.symbol, price, notional, impact_ratio, regime_ratio, is_attack)
-        ))
+        )
 
         self.last_price = price
         return {"type": "TRADE", "price": price, "volume": volume, "aggressor": aggressor, "regime_ratio": regime_ratio}
@@ -271,11 +318,12 @@ class EventEngine:
                 capped_refill = min(refill_ratio, 1.0)
                 cluster_score = (math.log(1 + cluster_attack_money) * capped_refill) / math.log(2 + duration_seconds)
                 
-                # ⚡ Đẩy vào Queue
-                db_queue.put((
+                # ⚡ Cluster metrics phục vụ research; nếu queue nghẽn thì không để nó làm treo realtime feed
+                enqueue_db(
                     'INSERT INTO cluster_metrics (timestamp, symbol, price_start, price_end, side, absorbed_notional, replenished_notional, attack_notional, duration, refill_ratio, cluster_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    (dt_str, self.state.symbol, p_start, p_end, side, cluster_absorbed_money, cluster_replenished_money, cluster_attack_money, duration_seconds, refill_ratio, cluster_score)
-                ))
+                    (dt_str, self.state.symbol, p_start, p_end, side, cluster_absorbed_money, cluster_replenished_money, cluster_attack_money, duration_seconds, refill_ratio, cluster_score),
+                    priority="low"
+                )
                 
                 if cluster_score > 1.2 and cluster_replenished_money >= 500_000_000:
                     cluster_key = (p_start, p_end, side)
@@ -368,10 +416,10 @@ class MultiSymbolOutcomeTracker:
                         dt_string = datetime.fromtimestamp(sig["signal_time"]).strftime('%Y-%m-%d %H:%M:%S')
                         
                         # ⚡ Đẩy vào Queue thay vì ghi trực tiếp
-                        db_queue.put((
+                        enqueue_db(
                             'INSERT INTO outcome_log (timestamp, symbol, event_type, side, signal_price, price_1m, price_5m, price_15m) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                             (dt_string, symbol, sig["event_type"], sig["side"], sig["signal_price"], sig["p_1m"], sig["p_5m"], sig["p_15m"])
-                        ))
+                        )
                         self.pending_signals.remove(sig)
 
 market_states = {sym: MarketState(sym) for sym in SYMBOLS_TO_WATCH}
@@ -442,11 +490,11 @@ def on_message(ws, message):
                         print(f"{c}[TRADE][{code}] {side_str:>4} | Price: {match_price:,.0f} | Vol: {match_vol:>5} | Regime: {trade_data.get('regime_ratio',1.0):.2f}\033[0m")
                         for alert in alerts: print(f"   ➤ {alert}")
 
-                        # ⚡ Đẩy vào Queue
-                        db_queue.put((
+                        # ⚡ Đẩy vào Queue có giới hạn
+                        enqueue_db(
                             "INSERT INTO trades (timestamp, symbol, price, volume, price_change, total_volume) VALUES (?, ?, ?, ?, ?, ?)",
                             (now, code, match_price, match_vol, aggressor, total_vol)
-                        ))
+                        )
 
                     elif "BidAsk" in str(channel_name) and len(parts) >= 60:
                         bp = [float(parts[i]) for i in range(3, 23, 2)]
@@ -466,16 +514,26 @@ def on_message(ws, message):
                         for alert in alerts: print(f"   ➤ {alert}")
                         print("-" * 65)
 
-                        params = [now, code]
-                        for i in range(10): params.extend([bp[i], bv[i]])
-                        for i in range(10): params.extend([ap[i], av[i]])
-                        placeholders = ', '.join(['?'] * 42)
-                        
-                        # ⚡ Đẩy vào Queue
-                        db_queue.put((
-                            f"INSERT INTO order_book (timestamp, symbol, b_p1, b_v1, b_p2, b_v2, b_p3, b_v3, b_p4, b_v4, b_p5, b_v5, b_p6, b_v6, b_p7, b_v7, b_p8, b_v8, b_p9, b_v9, b_p10, b_v10, a_p1, a_v1, a_p2, a_v2, a_p3, a_v3, a_p4, a_v4, a_p5, a_v5, a_p6, a_v6, a_p7, a_v7, a_p8, a_v8, a_p9, a_v9, a_p10, a_v10) VALUES ({placeholders})",
-                            tuple(params)
-                        ))
+                        now_ts = time.time()
+                        should_save_orderbook = (
+                            now_ts - last_orderbook_saved[code] >= ORDERBOOK_SAVE_INTERVAL
+                            or len(events) > 0
+                        )
+
+                        if should_save_orderbook:
+                            last_orderbook_saved[code] = now_ts
+                            params = [now, code]
+                            for i in range(10): params.extend([bp[i], bv[i]])
+                            for i in range(10): params.extend([ap[i], av[i]])
+                            placeholders = ', '.join(['?'] * 42)
+                            
+                            # ⚡ Order book là dữ liệu nặng: vẫn lưu top 10 để vẽ liquidity,
+                            # nhưng được sampling và cho phép drop nếu queue nghẽn.
+                            enqueue_db(
+                                f"INSERT INTO order_book (timestamp, symbol, b_p1, b_v1, b_p2, b_v2, b_p3, b_v3, b_p4, b_v4, b_p5, b_v5, b_p6, b_v6, b_p7, b_v7, b_p8, b_v8, b_p9, b_v9, b_p10, b_v10, a_p1, a_v1, a_p2, a_v2, a_p3, a_v3, a_p4, a_v4, a_p5, a_v5, a_p6, a_v6, a_p7, a_v7, a_p8, a_v8, a_p9, a_v9, a_p10, a_v10) VALUES ({placeholders})",
+                                tuple(params),
+                                priority="low"
+                            )
     except Exception: pass
 
 def on_error(ws, error): print(f"[ERROR] {error}")
