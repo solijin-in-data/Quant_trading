@@ -5,8 +5,9 @@ Tất cả những thay đổi đáng chú ý của dự án này sẽ được 
 ## [Unreleased]
 ### Added
 - [X] Xây dựng cơ chế tự động kết nối lại (Auto-reconnect) khi WebSocket bị ngắt.
-- [ ] Chuyển đổi quản lý `JWT_TOKEN` từ code cứng sang file `.env`.
-- [X] Tích hợp ghi log dữ liệu thô vào SQLite.
+- [ ] Xây dựng database thu thập dữ liệu backtest
+- [ ] Update logic tính toán 
+
 
 
 ## [0.6.0] - 2026-06-18
@@ -31,6 +32,7 @@ Tất cả những thay đổi đáng chú ý của dự án này sẽ được 
 - Tăng cường khả năng chịu lỗi khi parsing dữ liệu WebSocket đầu vào.
 - Cấu trúc lại file để tách biệt rõ ràng giữa logic Database và luồng xử lý thời gian thực.
 - Cập nhật cơ chế `ping_interval` và `ping_timeout` để duy trì kết nối WebSocket bền bỉ hơn trong môi trường mạng không ổn định.
+
 
 
 ## [0.5.1-Beta] - 2026-06-18
